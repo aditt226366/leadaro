@@ -1,0 +1,14 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+asyncpg==0.30.0
+pydantic==2.10.5
+python-jose[cryptography]==3.3.0
+bcrypt==4.2.1
+python-multipart==0.0.20
+pypdf==5.1.0
+httpx==0.28.1
+anthropic==0.117.0
+phonenumbers==8.13.53
+python-dotenv==1.0.1
+tzdata==2025.1
+livekit-api==1.2.0

@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: leadaro
+      POSTGRES_PASSWORD: leadaro
+      POSTGRES_DB: leadaro
+    # 5433 on the host — 5432 is taken by the existing leadflow_postgres.
+    ports: ["5433:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U leadaro"]
+      interval: 5s
+      retries: 10
+
+  # LiveKit media server + SIP bridge. Plivo trunks terminate here.
+  livekit:
+    image: livekit/livekit-server:latest
+    command: --config /etc/livekit.yaml --node-ip 127.0.0.1
+    ports:
+      - "7880:7880"       # ws / api
+      - "7881:7881"       # rtc tcp
+      - "50000-50100:50000-50100/udp"
+    volumes:
+      - ./infra/livekit.yaml:/etc/livekit.yaml:ro
+
+  livekit-sip:
+    image: livekit/sip:latest
+    depends_on: [livekit, redis]
+    ports:
+      - "5060:5060/udp"   # SIP signalling
+      - "10000-10100:10000-10100/udp"
+    volumes:
+      - ./infra/sip.yaml:/etc/sip.yaml:ro
+    environment:
+      SIP_CONFIG_FILE: /etc/sip.yaml
+
+  # Required by livekit-sip only. The app itself does not use Redis.
+  redis:
+    image: redis:7-alpine
+    # 6380 on the host — 6379 is taken by the existing leadflow_redis.
+    ports: ["6380:6379"]
+
+volumes:
+  pgdata:

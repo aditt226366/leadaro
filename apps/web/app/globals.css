@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+  Design tokens measured from the reference dashboard (screenshot 1).
+  Every screen composes from these — nothing hardcodes a hex.
+  If a component needs a colour that isn't here, the colour is wrong.
+*/
+:root {
+  /* surfaces */
+  --page:          #F6F6F9;   /* page bg — light gray-lavender, NOT white */
+  --surface:       #FFFFFF;
+  --surface-sunk:  #FAFAFC;   /* table header rows, inset wells */
+  --border:        #EFEFF2;
+  --border-strong: #E4E4EA;
+
+  /* text */
+  --text:          #1A1C23;
+  --text-muted:    #8B90A0;
+  --text-faint:    #A9AEBC;
+
+  /* brand */
+  --primary:       #5B5BD6;
+  --primary-ink:   #4B4BE8;   /* active nav label */
+  --primary-wash:  #EEF0FE;   /* active nav pill */
+  --primary-deep:  #4F46E5;
+
+  /* chart series — order matters; charts read these in sequence */
+  --c1: #4F46E5;
+  --c2: #7C6CF0;
+  --c3: #3B82F6;
+  --c4: #7DC4FB;
+  --c5: #22C7C7;
+  --c6: #A5B4FC;
+
+  /* status */
+  --pos:      #16A34A;
+  --pos-wash: #DCFCE7;
+  --neg:      #DC2626;
+  --neg-wash: #FEE2E2;
+  --warn:     #D97706;
+  --warn-wash:#FEF3C7;
+  --info:     #2563EB;
+  --info-wash:#DBEAFE;
+
+  /* geometry */
+  --r-card:  12px;
+  --r-pill:  8px;
+  --pad-card: 20px;
+  --gap:      16px;
+  --sidebar:  212px;
+}
+
+* { border-color: var(--border); }
+
+html, body {
+  background: var(--page);
+  color: var(--text);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Figures always align in columns. Non-negotiable on a metrics dashboard. */
+.tnum { font-variant-numeric: tabular-nums; }
+
+/* Scrollbars: thin and quiet, like the reference. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb {
+  background: #DDDDE4;
+  border: 3px solid var(--page);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover { background: #C9C9D4; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* Recharts is themed once, globally — no chart carries its own colours. */
+.recharts-cartesian-axis-tick text {
+  fill: var(--text-faint);
+  font-size: 11px;
+}
+.recharts-cartesian-grid line { stroke: var(--border); }
+.recharts-tooltip-wrapper { outline: none; }

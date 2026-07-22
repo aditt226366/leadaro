@@ -1,0 +1,19 @@
+# secrets — never commit real env files (the template .env.example is fine)
+.env
+.env.*
+!.env.example
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# node / next
+node_modules/
+.next/
+out/
+
+# misc
+.DS_Store
+*.log
