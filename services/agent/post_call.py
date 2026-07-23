@@ -1,21 +1,32 @@
 """
-Post-call worker — features 6, 7 and 8.
+Post-call worker — the SIX after-call features, all off the live turn loop.
 
     python services/agent/post_call.py
 
-Drains the `jobs` table. Runs off the call path entirely, so a slow summary
-never delays hangup and a failed summary never loses the call record.
+Drains the `jobs` table. Runs off the call path entirely (triggered by the
+`post_call` job that finish_call() enqueues), so a slow analysis never delays
+hangup and a failure never loses the call record.
 
-  6  AI Call Summary            → one LLM pass over the transcript
-  7  AI Follow-up Recommendation → rule-driven, suppressed on rejection
-  8  AI Lead Qualification       → turn-count tiering
+Every feature reads the saved TRANSCRIPT (the turns table) as its input — text,
+not audio, not the live session. The transcript is loaded ONCE and one Sonnet
+4.6 pass produces:
+
+  4  AI Sentiment Detection       → overall_sentiment + sentiment_trajectory
+  5  AI Intent Recognition        → the caller's final intent(s)
+  6  AI Call Summary              → summary + key points + pain points
+  8  AI Lead Qualification        → HOT/WARM/SCRAP from transcript signals
+  9  AI Next Best Action          → from the analyzed transcript
+  7  AI Follow-up Recommendation  → from summary + sentiment + outcome
+                                     (rule-driven suppression on rejection)
+
+None of the six run inside the live turn loop — the live turn only replies,
+handles an inline objection, and captures a booking (see brain.py / lk_llm.py).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import sys
-from datetime import timedelta
 from pathlib import Path
 from typing import Literal
 
@@ -27,7 +38,7 @@ import db  # noqa: E402
 import llm as api_llm  # noqa: E402
 
 from rules import (  # noqa: E402
-    ConversationState, followup_delay_days, qualify, should_follow_up,
+    BUYING_INTENTS, ConversationState, qualify, should_follow_up,
 )
 
 load_dotenv()
@@ -37,7 +48,21 @@ log = logging.getLogger("post_call")
 POLL_SECONDS = 3
 MAX_ATTEMPTS = 3
 
-SUMMARY_SYSTEM = """You analyse completed sales call transcripts.
+# Warmer leads get chased sooner. Keyed by the transcript-derived tier below.
+FOLLOWUP_DELAY_DAYS = {"hot": 1, "warm": 2, "scrap": 5}
+
+SUMMARY_SYSTEM = """You analyse completed sales call transcripts. Everything you \
+return is derived from the transcript text and nothing else.
+
+Work in this order:
+  1. Read the whole transcript, then write the summary, key points and pain \
+points, and the caller's overall sentiment (a number from -1.0 hostile to 1.0 \
+enthusiastic) with a one-line trajectory of how it moved.
+  2. Classify the caller's final intent(s) and qualify the lead as hot, warm or \
+scrap FROM WHAT THEY SAID and asked for — not from how many turns it took. A \
+short call where they ask to book is hot; a long call that goes nowhere is not.
+  3. Only then, from that analysis plus the recorded outcome, write the \
+follow-up recommendation and the single next best action.
 
 Be strictly factual. Every field must be supported by something actually said \
 on the call. If the caller never mentioned budget, leave budget empty — do not \
@@ -47,6 +72,8 @@ because a rep will act on it."""
 
 
 class Summary(BaseModel):
+    """One structured pass over the transcript that carries all six features."""
+    # AI Call Summary (feature 6) — read straight from the transcript.
     summary: str = Field(description="2-3 sentences on what happened.")
     key_points: list[str] = Field(default_factory=list, max_length=6)
     action_items: list[str] = Field(default_factory=list, max_length=6)
@@ -54,10 +81,33 @@ class Summary(BaseModel):
     next_steps: str = ""
     budget: str = ""
     timeline: str = ""
-    qualification_score: int = Field(ge=0, le=100)
+    # AI Sentiment Detection (feature 4) — from the transcript, not per-turn.
+    overall_sentiment: float = Field(ge=-1.0, le=1.0, default=0.0)
+    sentiment_trajectory: str = ""
+    # AI Intent Recognition (feature 5) — the caller's final intent(s).
+    intents: list[str] = Field(default_factory=list, max_length=6)
+    # AI Lead Qualification (feature 8) — HOT/WARM/SCRAP from transcript signals.
+    qualification_tier: Literal["hot", "warm", "scrap"] = "scrap"
+    qualification_score: int = Field(ge=0, le=100, default=0)
+    # AI Follow-up (feature 7) + Next Best Action (feature 9) — derived last.
     followup_recommendation: str = ""
+    next_best_action: str = ""
     meeting_requested: bool = False
     meeting_time_hint: str = ""
+
+
+def _resolve_tier(parsed: "Summary | None", state: ConversationState) -> str:
+    """
+    Feature 8 — lead tier from transcript signals (the model's read), floored by
+    an explicit buying intent: asking to book is never scrap, however short the
+    call. Falls back to engagement-depth tiering when the LLM pass didn't run.
+    """
+    if not parsed:
+        return qualify(state)
+    if any(i in BUYING_INTENTS for i in (parsed.intents or [])) or \
+       any(i in BUYING_INTENTS for i in state.intents):
+        return "hot"
+    return parsed.qualification_tier
 
 
 async def handle_post_call(payload: dict) -> None:
@@ -81,36 +131,34 @@ async def handle_post_call(payload: dict) -> None:
         call_id,
     )
 
-    # Rebuild the rule state from what was persisted, so tiering is computed
-    # from the same counters the live call used.
+    # Rebuild the rule state from what was persisted, so the fallback tiering and
+    # follow-up suppression run off the same counters the live call used.
     #
     # Read the AGENT rows, not the lead rows. intent and sentiment are the
-    # model's reading OF the caller's last utterance, and they are written on
-    # the agent turn that responds to it — the lead row stores only the raw
-    # transcript, with both columns NULL.
-    #
-    # Reading lead rows meant every replayed call scored sentiment 0.0 and
-    # intent "neutral" for every turn, which silently disabled sentiment
-    # analytics, flattened tiering, and — worst — stopped should_follow_up()
-    # from ever seeing "not_interested". Callers who explicitly said no were
-    # still being scheduled for a follow-up.
-    #
-    # The greeting is an agent turn with no intent (nothing was said to it yet),
-    # so filter on intent rather than role alone.
+    # model's reading OF the caller's last utterance, written on the agent turn
+    # that responds to it — the lead row stores only the raw transcript, both
+    # columns NULL. Reading lead rows would score every replayed call sentiment
+    # 0.0 / intent "neutral" and stop should_follow_up() ever seeing
+    # "not_interested". The greeting is an agent turn with no intent, so filter
+    # on intent rather than role alone.
     state = ConversationState()
     for t in turns:
         if t["role"] == "agent" and t["intent"]:
             state.record(t["sentiment"] or 0.0, t["intent"])
 
-    tier = qualify(state)
-
     if not turns:
-        # Voicemail / no-answer: tier it, skip the LLM, still allow follow-up.
+        # Voicemail / no-answer: tier from engagement depth, skip the LLM, still
+        # allow follow-up.
+        tier = qualify(state)
         await _write_summary(call_id, None, tier, state)
         await _maybe_schedule_followup(call, state, tier)
         await _update_lead(call, tier)
         return
 
+    # The transcript is the single source of truth for all six features. Loaded
+    # once, analysed once — sentiment/intent/summary/qualification come from the
+    # raw transcript; follow-up + next-best-action are derived from that analysis
+    # in the same structured pass (see SUMMARY_SYSTEM ordering).
     transcript = "\n".join(
         f"{'AGENT' if t['role'] == 'agent' else 'CALLER'}: {t['text']}" for t in turns
     )
@@ -121,14 +169,15 @@ async def handle_post_call(payload: dict) -> None:
             f"Outcome recorded: {call['outcome'] or 'unknown'}\n"
             f"Duration: {call['duration_sec'] or 0}s over {len(turns)} turns\n\n"
             f"Transcript:\n{transcript}",
-            max_tokens=1200,
+            max_tokens=1400,
             output_format=Summary,
         )
     except Exception:
-        # A failed summary must not lose the tiering or the follow-up.
-        log.exception("summary generation failed for %s", call_id)
+        # A failed analysis must not lose the tiering or the follow-up.
+        log.exception("transcript analysis failed for %s", call_id)
         parsed = None
 
+    tier = _resolve_tier(parsed, state)
     await _write_summary(call_id, parsed, tier, state)
     await _maybe_schedule_followup(call, state, tier, parsed)
     await _update_lead(call, tier)
@@ -144,12 +193,22 @@ async def handle_post_call(payload: dict) -> None:
 
 async def _write_summary(call_id, parsed: Summary | None, tier: str,
                          state: ConversationState) -> None:
-    avg = (sum(state.sentiments) / len(state.sentiments)) if state.sentiments else None
+    # Sentiment is the transcript-derived reading when we have it; otherwise the
+    # average of the per-turn live scores (voicemail / analysis-failed paths).
+    if parsed:
+        sentiment_avg = parsed.overall_sentiment
+        trajectory = parsed.sentiment_trajectory
+        intents = parsed.intents
+        next_best = parsed.next_best_action
+    else:
+        sentiment_avg = (sum(state.sentiments) / len(state.sentiments)) if state.sentiments else None
+        trajectory, intents, next_best = "", [], ""
     await db.execute(
         """INSERT INTO call_summaries (call_id, summary, key_points, action_items,
                next_steps, pain_points, budget, timeline, sentiment_avg,
-               lead_tier, qualification_score, followup_recommendation)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+               lead_tier, qualification_score, followup_recommendation,
+               intents, next_best_action, sentiment_trajectory)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
            ON CONFLICT (call_id) DO UPDATE SET
              summary=EXCLUDED.summary, key_points=EXCLUDED.key_points,
              action_items=EXCLUDED.action_items, next_steps=EXCLUDED.next_steps,
@@ -157,7 +216,10 @@ async def _write_summary(call_id, parsed: Summary | None, tier: str,
              timeline=EXCLUDED.timeline, sentiment_avg=EXCLUDED.sentiment_avg,
              lead_tier=EXCLUDED.lead_tier,
              qualification_score=EXCLUDED.qualification_score,
-             followup_recommendation=EXCLUDED.followup_recommendation""",
+             followup_recommendation=EXCLUDED.followup_recommendation,
+             intents=EXCLUDED.intents,
+             next_best_action=EXCLUDED.next_best_action,
+             sentiment_trajectory=EXCLUDED.sentiment_trajectory""",
         call_id,
         parsed.summary if parsed else "No conversation took place.",
         parsed.key_points if parsed else [],
@@ -166,10 +228,13 @@ async def _write_summary(call_id, parsed: Summary | None, tier: str,
         parsed.pain_points if parsed else [],
         parsed.budget if parsed else "",
         parsed.timeline if parsed else "",
-        avg,
+        sentiment_avg,
         tier,
         parsed.qualification_score if parsed else 0,
         parsed.followup_recommendation if parsed else "",
+        intents,
+        next_best,
+        trajectory,
     )
 
 
@@ -182,7 +247,8 @@ async def _maybe_schedule_followup(call, state: ConversationState, tier: str,
         log.info("follow-up suppressed for call %s (explicit rejection)", call["id"])
         return
 
-    days = followup_delay_days(state)
+    # Cadence follows the transcript-derived tier, not raw turn count.
+    days = FOLLOWUP_DELAY_DAYS.get(tier, 5)
     await db.execute(
         """INSERT INTO followups (org_id, lead_id, call_id, channel, due_at,
                                   payload, reason)

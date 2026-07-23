@@ -81,22 +81,22 @@ async def check_cartesia(voice_id: str | None) -> None:
         record(BAD, "Cartesia TTS", str(e)[:120])
 
 
-async def check_cartesia_stt() -> None:
-    """Transcription runs on Cartesia; the call path has no ElevenLabs dependency."""
-    key = os.environ.get("CARTESIA_API_KEY")
+async def check_deepgram_stt() -> None:
+    """Transcription runs on Deepgram Nova-3 (language=multi)."""
+    key = os.environ.get("DEEPGRAM_API_KEY")
     if not key:
-        record(BAD, "Cartesia STT", "CARTESIA_API_KEY not set")
+        record(BAD, "Deepgram STT", "DEEPGRAM_API_KEY not set")
         return
     try:
         async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.get("https://api.cartesia.ai/voices/?limit=1",
-                            headers={"X-API-Key": key,
-                                     "Cartesia-Version": "2024-11-13"})
-        record(OK if r.status_code == 200 else BAD, "Cartesia STT",
-               "key valid (ink-whisper)" if r.status_code == 200
+            # Listing projects requires a valid key and touches nothing.
+            r = await c.get("https://api.deepgram.com/v1/projects",
+                            headers={"Authorization": f"Token {key}"})
+        record(OK if r.status_code == 200 else BAD, "Deepgram STT",
+               "key valid (nova-3, multi)" if r.status_code == 200
                else f"HTTP {r.status_code}")
     except Exception as e:
-        record(BAD, "Cartesia STT", str(e)[:120])
+        record(BAD, "Deepgram STT", str(e)[:120])
 
 
 async def check_elevenlabs() -> None:
@@ -198,7 +198,7 @@ async def main() -> int:
 
     await check_db()
     await check_anthropic()
-    await check_cartesia_stt()
+    await check_deepgram_stt()
     await check_cartesia(voice_id)
     await check_elevenlabs()
     await check_livekit()

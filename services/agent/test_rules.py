@@ -38,12 +38,25 @@ def test_neutral_flatline_shortens_pitch():
     assert decide(state([0.05] * 4), "neutral", "continue") is Directive.CONTINUE
 
 
-def test_negative_streak_exits():
-    # FRD: negative 3+ turns → stop pitch → offer graceful exit
+def test_negative_streak_does_not_hang_up():
+    # Regression: sustained negative sentiment must NOT auto-end the call — that
+    # was cutting callers off mid-conversation. It de-escalates instead; only an
+    # explicit decline, silence/unclear, or a hangup ends a call.
     s = state([-0.6] * 3)
     assert s.negative_turns == 3
-    assert decide(s, "objection", "continue") is Directive.EXIT_POLITE
-    assert decide(state([-0.6] * 2), "objection", "continue") is Directive.CONTINUE
+    assert decide(s, "objection", "continue") is Directive.HANDLE_OBJECTION
+    # A caller who explicitly declines still exits, via the intent (not sentiment).
+    assert decide(s, "not_interested", "continue") is Directive.EXIT_APOLOGETIC
+
+
+def test_model_cannot_close_in_opening_turns():
+    # Regression: the model returning close_* on turn one was a spurious cut.
+    early = state([0.2])                      # 1 turn
+    assert decide(early, "neutral", "close_positive") is Directive.CONTINUE
+    assert decide(early, "neutral", "close_negative") is Directive.CONTINUE
+    # Once the call is genuinely underway, a model close is honoured.
+    later = state([0.2, 0.1, 0.3])            # 3 turns
+    assert decide(later, "neutral", "close_positive") is Directive.EXIT_POLITE
 
 
 def test_silence_then_unclear_strikes():
@@ -67,7 +80,29 @@ def test_transfer_intents_beat_sentiment_rules():
     angry = state([-0.7] * 3)
     assert decide(angry, "speak_to_human", "continue") is Directive.TRANSFER_HUMAN
     assert decide(state(), "complaint", "continue") is Directive.TRANSFER_HUMAN
-    assert decide(state(), "book_demo", "continue") is Directive.TRANSFER_HUMAN
+
+
+def test_opt_out_overrides_every_other_rule():
+    # COMPLIANCE: "remove me / stop calling / do not call again" (intent
+    # do_not_call) must win over EVERYTHING — a hot streak, a booking action, an
+    # objection streak, even a competing exit/transfer intent — so a legal
+    # opt-out is never lost to a spurious upsell or mis-routed to a human.
+    hot = state([0.9] * 9)                      # warmest possible caller
+    assert decide(hot, "do_not_call", "book_meeting") is Directive.OPT_OUT
+    angry = state([-0.7] * 5)                   # deep negative streak
+    assert decide(angry, "do_not_call", "handle_objection") is Directive.OPT_OUT
+    # Even on turn one, before the model-close guard would allow any ending.
+    assert decide(state(), "do_not_call", "continue") is Directive.OPT_OUT
+    # It is NOT the same as a soft decline (which apologises and may still sign off).
+    assert decide(state(), "not_interested", "continue") is Directive.EXIT_APOLOGETIC
+
+
+def test_book_demo_is_a_booking_not_a_transfer():
+    # book_demo is a BUYING signal, not a hand-off: it must NOT route to a human
+    # (that made a booking terminate the call before the sign-off could play).
+    # It follows the model's next_action like any other in-conversation turn.
+    assert decide(state(), "book_demo", "continue") is Directive.CONTINUE
+    assert decide(state(), "book_demo", "book_meeting") is Directive.BOOK_MEETING
 
 
 def test_deep_dive_intents():

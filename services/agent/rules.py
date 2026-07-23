@@ -19,7 +19,10 @@ NEUTRAL_BAND = 0.2             # |sentiment| under this is "flat"
 
 POSITIVE_TURNS_TO_CLOSE = 8    # 8+ positive turns → go for the meeting now
 NEUTRAL_TURNS_TO_SHORTEN = 5   # 5+ flat turns → caller disengaged, cut to the ask
-NEGATIVE_TURNS_TO_EXIT = 3     # 3+ negative turns → stop pitching, exit politely
+NEGATIVE_TURNS_TO_SOFTEN = 3   # 3+ negative turns → de-escalate (NOT exit)
+# The model may not end the call before this many turns — a "close" in the
+# opening exchange is a misfire that cuts the caller off mid-question.
+MIN_TURNS_BEFORE_MODEL_CLOSE = 3
 
 HOT_LEAD_TURNS = 10            # 10+ turns → hot
 WARM_LEAD_TURNS = 5            # 5–9 turns → warm; 1–4 → scrap
@@ -43,10 +46,24 @@ BUYING_INTENTS = frozenset({"book_meeting", "book_demo"})
 WARM_INTENTS = frozenset({"interested", "price_inquiry", "more_info", "call_later"})
 
 # Intents that hand off to a human immediately (FRD feature 5 / 9).
-TRANSFER_INTENTS = frozenset({"speak_to_human", "support", "complaint", "book_demo"})
+#
+# book_demo is NOT here: it is a BUYING signal (see BUYING_INTENTS above), an
+# in-conversation booking step — not a transfer. Routing it to a human made a
+# booking terminate the call via the transfer path before the script's closing
+# and thank-you could play. The agent books the demo itself; only an explicit
+# "speak to a human" / support / complaint hands off.
+TRANSFER_INTENTS = frozenset({"speak_to_human", "support", "complaint"})
 
 # Intents that end the call politely with an apology (FRD feature 5).
 EXIT_INTENTS = frozenset({"not_interested", "spam", "wrong_number"})
+
+# COMPLIANCE — the caller asked to be removed / not called again ("stop calling",
+# "take me off your list", "do not call me", in ANY language). This is NOT a soft
+# "not interested": it is a legal opt-out that must HARD-INTERRUPT the call, be
+# recorded to the DNC suppression list, and end with a bare confirmation — no
+# closing, no thank-you, no sales sign-off. It outranks every other rule below,
+# including booking and objection handling, so it is checked FIRST in decide().
+OPT_OUT_INTENTS = frozenset({"do_not_call", "opt_out"})
 
 # Intents that mean "explain in depth and mark as hot" (FRD feature 9).
 DEEP_DIVE_INTENTS = frozenset({"price_inquiry", "more_info"})
@@ -64,6 +81,21 @@ class Directive(StrEnum):
     OFFER_CALLBACK = "offer_callback"
     EXIT_POLITE = "exit_polite"
     EXIT_APOLOGETIC = "exit_apologetic"
+    OPT_OUT = "opt_out"          # compliance removal — hard interrupt, DNC + bare bye
+
+
+# The directives that actually hang up the call. The worker watches for these
+# to tear the session down; decide() guards them so the model can't trigger one
+# in the opening turns.
+#
+# OPT_OUT is terminal too but is DELIBERATELY not in this set: these go through
+# the "is the customer still talking?" resume-confirmation path, whereas an
+# opt-out is a HARD INTERRUPT that must never be second-guessed or resumed. The
+# worker handles OPT_OUT on its own branch, ahead of these. (This also means an
+# opt-out spoken DURING a close-confirmation window is treated as a fresh,
+# non-terminal turn there and re-evaluated, so it still ends via the opt-out
+# path — with a bare confirmation — rather than the sales sign-off.)
+TERMINAL_DIRECTIVES = frozenset({Directive.EXIT_POLITE, Directive.EXIT_APOLOGETIC})
 
 
 @dataclass
@@ -73,6 +105,9 @@ class ConversationState:
     intents: list[str] = field(default_factory=list)
     silence_strikes: int = 0
     unclear_strikes: int = 0
+    # True once the agent has moved to book a meeting. Drives the dedicated
+    # closing message so a booked call ends warmly, not with an abrupt cut.
+    booking_engaged: bool = False
 
     # ── counters ─────────────────────────────────────────────────────────────
 
@@ -112,6 +147,13 @@ def decide(state: ConversationState, intent: str, model_action: str) -> Directiv
     no deterministic rule fires, so the model can steer within the guardrails
     rather than around them.
     """
+    # 0. COMPLIANCE — "remove me / stop calling / do not call again". Outranks
+    #    EVERYTHING, including booking and objection handling: a legal opt-out is
+    #    not negotiable and is never worth a spurious upsell. The worker turns
+    #    this into an immediate DNC write + a bare confirmation, then hangs up.
+    if intent in OPT_OUT_INTENTS:
+        return Directive.OPT_OUT
+
     # 1. Hard exits — caller said no, wrong number, or flagged us as spam.
     if intent in EXIT_INTENTS:
         return Directive.EXIT_APOLOGETIC
@@ -121,14 +163,19 @@ def decide(state: ConversationState, intent: str, model_action: str) -> Directiv
         return Directive.TRANSFER_HUMAN
 
     # 3. Non-responsive caller. Silence closes; garbled audio offers a callback.
+    #    These are the ONLY threshold-driven ends allowed — two strikes each.
     if state.silence_strikes >= MAX_SILENCE_STRIKES:
         return Directive.EXIT_POLITE
     if state.unclear_strikes >= MAX_UNCLEAR_STRIKES:
         return Directive.OFFER_CALLBACK
 
-    # 4. Sustained negativity — stop pitching before we annoy them further.
-    if state.negative_turns >= NEGATIVE_TURNS_TO_EXIT:
-        return Directive.EXIT_POLITE
+    # 4. Sustained negativity does NOT end the call. Auto-hanging-up on a few
+    #    negative-scored turns was cutting callers off mid-conversation. A call
+    #    ends on an explicit decline (rule 1), silence/unclear (rule 3), or the
+    #    caller hanging up — never because sentiment dipped. Redirect instead:
+    #    address the concern once and let the caller decide.
+    if state.negative_turns >= NEGATIVE_TURNS_TO_SOFTEN:
+        return Directive.HANDLE_OBJECTION
 
     # 5. Sustained warmth — stop selling and ask for the meeting.
     if state.positive_turns >= POSITIVE_TURNS_TO_CLOSE:
@@ -142,8 +189,12 @@ def decide(state: ConversationState, intent: str, model_action: str) -> Directiv
     if intent in DEEP_DIVE_INTENTS:
         return Directive.EXPLAIN_DETAIL
 
-    # 8. Nothing deterministic fired — follow the model.
-    return {
+    # 8. Nothing deterministic fired — follow the model, with one guard: the
+    #    model may not END the call in the opening turns. A "close" on turn one
+    #    is a misfire, and cutting off a caller who just asked a question is
+    #    exactly the reported bug. Genuine end conditions (decline intent,
+    #    silence, unclear) are handled above and are unaffected by this guard.
+    mapped = {
         "book_meeting": Directive.BOOK_MEETING,
         "handle_objection": Directive.HANDLE_OBJECTION,
         "transfer_human": Directive.TRANSFER_HUMAN,
@@ -152,6 +203,9 @@ def decide(state: ConversationState, intent: str, model_action: str) -> Directiv
         "close_negative": Directive.EXIT_POLITE,
         "explain_detail": Directive.EXPLAIN_DETAIL,
     }.get(model_action, Directive.CONTINUE)
+    if mapped in TERMINAL_DIRECTIVES and state.turn_count < MIN_TURNS_BEFORE_MODEL_CLOSE:
+        return Directive.CONTINUE
+    return mapped
 
 
 def qualify(state: ConversationState) -> str:

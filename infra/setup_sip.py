@@ -36,6 +36,11 @@ DEST_COUNTRY = os.environ.get("SIP_DESTINATION_COUNTRY", "").lower()
 OUT_NAME = "plivo-outbound"
 IN_NAME = "plivo-inbound"
 
+# Must match services/agent/worker.py AGENT_NAME and dialer.py AGENT_NAME. The
+# inbound dispatch rule routes calls to a worker registered under this exact
+# name — a mismatch means inbound calls ring with nobody to answer.
+AGENT_NAME = "leadaro-voice"
+
 
 def write_env(updates: dict[str, str]) -> None:
     path = ROOT / ".env"
@@ -156,7 +161,7 @@ async def main() -> int:
                     ),
                     room_config=api.RoomConfiguration(
                         agents=[api.RoomAgentDispatch(
-                            agent_name="leadaro-voice",
+                            agent_name=AGENT_NAME,
                             metadata=f'{{"to_number":"{NUMBER}"}}',
                         )]
                     ),

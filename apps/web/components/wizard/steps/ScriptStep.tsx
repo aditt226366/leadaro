@@ -21,6 +21,8 @@ const SECTIONS: [key: string, label: string, hint: string][] = [
   ["objection_handling", "Objection handling", "How to respond to pushback."],
   ["closing_statement", "Closing statement", "How to end a good call."],
   ["thank_you", "Thank you", "Sign-off."],
+  ["ending_message", "Ending message",
+    "Spoken before the call ends after a booking. Empty = a warm default, in the call's language."],
   ["voicemail_message", "Voicemail message", "Left when a machine answers."],
   ["fallback_script", "Fallback", "When the AI can't understand the caller."],
   ["transfer_script", "Transfer", "Said just before handing to a human."],

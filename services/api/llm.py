@@ -4,12 +4,16 @@ Anthropic client shared by the API's pre/post-call features.
 The live per-turn call does NOT live here — it is in services/agent/brain.py,
 where latency is the binding constraint. These calls are user-initiated and
 off the critical path, so they run at normal effort with thinking enabled.
+
+Both the live turn (services/agent/brain.py, LLM_MODEL) and these calls
+(SUMMARY_MODEL) run Claude Sonnet 4.6. Latency does not matter here; quality
+does, so these run at normal effort with thinking enabled.
 """
 import os
 
 from anthropic import AsyncAnthropic
 
-MODEL = os.environ.get("LLM_MODEL", "claude-sonnet-4-6")
+MODEL = os.environ.get("SUMMARY_MODEL", "claude-sonnet-4-6")
 
 client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY / ant profile
 

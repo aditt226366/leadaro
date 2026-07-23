@@ -50,6 +50,14 @@ Score their sentiment from -1.0 (hostile) to 1.0 (enthusiastic), classify their 
 intent, and choose the delivery that fits: if they sound irritated, soften and \
 slow down; if they warm up, become more confident and move toward the ask.
 
+REMOVAL REQUESTS (this overrides everything else)
+If the caller asks to be removed, to stop being called, to be taken off your \
+list, or to not be contacted again — in ANY language, however they phrase it — \
+set intent to "do_not_call". This is different from "not interested": it is a \
+request to never be called again, not just a no for today. On that turn, reply \
+with only a short, respectful acknowledgement. Do NOT pitch, do NOT ask a \
+question, do NOT try to change their mind — the call is ending.
+
 YOUR OUTPUT
 Return the reply plus its delivery settings, the caller's intent and sentiment, \
 and the next action. The reply field is spoken aloud verbatim — it must contain \
@@ -83,6 +91,84 @@ DIRECTIVE_NUDGE: dict[Directive, str] = {
 }
 
 
+# Spoken language names for the prompt. The dashboard stores ISO codes; the
+# model needs the name, and "Speak ta" is not an instruction it follows well.
+LANG_NAMES = {
+    "en": "English", "hi": "Hindi", "ta": "Tamil", "te": "Telugu",
+    "ml": "Malayalam", "es": "Spanish", "fr": "French", "de": "German",
+    "it": "Italian", "pt": "Portuguese", "ja": "Japanese",
+    "zh": "Mandarin Chinese", "ar": "Arabic",
+}
+
+
+def language_name(code: str | None) -> str:
+    return LANG_NAMES.get((code or "en"), code or "en")
+
+
+# Spoken after a booking is confirmed, before the call ends — so a booked call
+# closes warmly instead of cutting off. Campaign-overridable via
+# script.ending_message; translated into the call's language when non-English.
+DEFAULT_ENDING_MESSAGE = (
+    "Thank you for your time. You'll get a confirmation shortly, and our team "
+    "will connect with you at the scheduled time. Have a great day!"
+)
+
+
+# campaign.type → how the agent runs the whole conversation. Keys are the exact
+# values the wizard writes. An unlisted type falls back to a generic outreach
+# stance rather than being ignored.
+CAMPAIGN_TYPE_MODE = {
+    "cold_calling":
+        "This is a COLD outreach call. The lead does not know you. Introduce "
+        "yourself and the company, earn interest from scratch, and qualify their "
+        "fit before pitching anything.",
+    "follow_up":
+        "This is a FOLLOW-UP call. You have been in contact before. Reference the "
+        "prior conversation naturally and move things toward the next step.",
+    "demo_booking":
+        "This is an APPOINTMENT-BOOKING call. Your job is to get a demo or meeting "
+        "on the calendar. Once there is any interest, drive toward agreeing a "
+        "specific day and time.",
+    "renewal_reminder":
+        "This is a RENEWAL REMINDER. Be transactional and respectful. Remind them "
+        "their renewal is due and confirm or arrange it. Do not hard-sell.",
+    "customer_success":
+        "This is a CUSTOMER-SUCCESS check-in. You are NOT selling. Make sure they "
+        "are getting value, surface any problems, and offer help.",
+    "recruitment":
+        "This is a RECRUITMENT screening call. Assess the candidate against the "
+        "role, answer their questions, and move a good fit toward the next stage.",
+    "promotional_campaign":
+        "This is a PROMOTIONAL call. Share the offer clearly, gauge interest, and "
+        "respect a no quickly without pushing.",
+    "nps_campaign":
+        "This is an NPS / feedback SURVEY. Ask the survey questions, capture the "
+        "answers accurately, and do NOT sell anything.",
+}
+
+# campaign.goal → the north star the agent steers every turn toward. Keys are the
+# exact values the wizard writes; an unlisted goal is used as-is.
+CAMPAIGN_GOAL_OBJECTIVE = {
+    "book_meeting":
+        "Book a meeting. Once there is interest, collect a specific day and time "
+        "and confirm it.",
+    "qualify_lead":
+        "Qualify the lead. Establish their budget, authority, need and timeline, "
+        "then judge their fit.",
+    "follow_up":
+        "Confirm where things stand and agree the next touchpoint.",
+    "collect_payment":
+        "Deliver the payment reminder clearly and confirm they will pay or arrange "
+        "it.",
+    "survey":
+        "Run the question set and capture each answer accurately.",
+    "reengage":
+        "Rekindle interest with a relevant reason to come back.",
+    "confirm_verify":
+        "Verify the details on file and confirm them.",
+}
+
+
 def build_system(campaign: dict) -> str:
     """
     Assemble the cacheable system prompt from campaign config only.
@@ -96,27 +182,65 @@ def build_system(campaign: dict) -> str:
     persona = cfg.get("persona") or "a friendly, professional sales representative"
     parts.append(f"\nYOUR PERSONA\nYou are {persona} for {campaign.get('org_name', 'the company')}.")
 
+    # campaign.type sets how the whole conversation runs.
+    if ctype := campaign.get("type"):
+        stance = CAMPAIGN_TYPE_MODE.get(
+            ctype,
+            f"This is a {ctype.replace('_', ' ')} call. Run it in the manner that "
+            f"name implies.")
+        parts.append(f"\nCALL TYPE\n{stance}")
+
+    # campaign.goal is the north star every turn steers toward.
     if goal := campaign.get("goal"):
-        parts.append(f"\nCALL OBJECTIVE\n{goal}")
+        objective = CAMPAIGN_GOAL_OBJECTIVE.get(goal, goal.replace("_", " "))
+        parts.append(f"\nYOUR OBJECTIVE THIS CALL\n{objective}\n"
+                     "Steer every turn toward this objective without being pushy.")
+
+    # Who the call is from — the agent may state this if asked or when relevant.
+    if dept := campaign.get("department"):
+        parts.append(f"\nYou are calling from the {dept} team.")
+
+    # Delivery tone, set on the campaign's voice config.
+    if tone := cfg.get("tone"):
+        parts.append(f"\nTONE\nCarry a {tone} tone throughout.")
 
     sections = [
         ("Greeting", "greeting"), ("Introduction", "introduction"),
         ("Pain point", "pain_point"), ("Offer", "offer"),
         ("Call to action", "cta"), ("Objection handling", "objection_handling"),
-        ("Closing", "closing_statement"), ("If transferring", "transfer_script"),
+        ("Closing", "closing_statement"), ("Thank you", "thank_you"),
+        ("If transferring", "transfer_script"),
         ("If you cannot understand them", "fallback_script"),
     ]
     written = [f"{label}: {script[key]}" for label, key in sections if script.get(key)]
     if written:
-        parts.append("\nYOUR SCRIPT\nAdapt these — do not read them robotically.\n"
-                     + "\n".join(written))
+        parts.append(
+            "\nYOUR SCRIPT (follow these stages IN ORDER as the conversation "
+            "progresses — use each as the goal for that phase, adapt the wording "
+            "to what the caller says, do not read them robotically)\n"
+            "Flow: Introduction, then Pain point, Offer, Call to action, handle "
+            "any Objection, then Closing and Thank you before the call ends. Your "
+            "opening greeting has ALREADY been delivered — do NOT greet again; "
+            "your first reply continues from the Introduction.\n"
+            "The stage text may contain {{placeholders}} — you will be told the "
+            "actual values; NEVER speak a literal double-brace token.\n"
+            + "\n".join(written))
 
     if kb := script.get("knowledge_base"):
         parts.append(f"\nFACTS YOU MAY USE\n{kb}")
 
-    if lang := campaign.get("language"):
-        if lang != "en":
-            parts.append(f"\nLANGUAGE\nSpeak {lang}. Switch only if they ask.")
+    # Language is stated unconditionally and strongly. The script above may be
+    # written in English; the model must translate its meaning into the target
+    # language rather than read it verbatim. This is what stopped a Tamil
+    # campaign from being conducted in English.
+    lang_name = language_name(campaign.get("language"))
+    parts.append(
+        f"\nLANGUAGE (STRICT)\n"
+        f"You speak ONLY in {lang_name}. Every word you say is in {lang_name}, "
+        f"from the very first word. The script and facts above may be written in "
+        f"English — say their meaning in {lang_name}, never in English. Switch "
+        f"language only if the caller explicitly asks you to."
+    )
 
     return "\n".join(parts)
 

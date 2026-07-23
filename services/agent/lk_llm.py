@@ -39,14 +39,19 @@ log = logging.getLogger(__name__)
 # When LiveKit makes that public, this becomes a few lines. Until then the real
 # latency work is preemptive_generation (measured: 860ms) and co-location.
 
-# Cartesia takes speed as a float; the model speaks in words.
-_SPEED = {"slow": -0.4, "normal": 0.0, "fast": 0.35}
+# Speech rate -> Cartesia sonic-3 `speed` (valid range 0.6-2.0; 1.0 is neutral).
+# The model and the campaign both speak in words; this is the SINGLE source that
+# maps those onto the sonic-3 float, so the two call sites — per-turn delivery
+# here and the base speed in worker._build_session — can never drift out of
+# range again. (The old -1..1 scale was for sonic-2 and silently sent invalid
+# values on sonic-3: normal=0.0 was dropped, slow/fast fell below/near 0.6.)
+SPEED_SCALE = {"slow": 0.8, "normal": 1.0, "fast": 1.3}
 
 
 class BrainLLM(llm.LLM):
     """LiveKit LLM plugin backed by one Brain instance (one per call)."""
 
-    def __init__(self, brain: Brain, on_turn=None, tts=None):
+    def __init__(self, brain: Brain, on_turn=None, tts=None, pause_tag=""):
         super().__init__()
         self.brain = brain
         # Called with the completed TurnResult after each turn — the worker uses
@@ -55,6 +60,10 @@ class BrainLLM(llm.LLM):
         # Needed to apply per-turn emotion and speed; without it the whole call
         # is spoken in one static register.
         self.tts = tts
+        # Natural-pause markup appended after each spoken sentence (the campaign's
+        # "Pause Controls" -> Cartesia `<break time="Nms"/>`). Empty when off.
+        # Integer ms only, to dodge the tokenizer's tag-split-on-decimal bug.
+        self.pause_tag = pause_tag
         self._pending_directive = None
 
     def chat(self, *, chat_ctx: llm.ChatContext, tools=None, conn_options=None,
@@ -82,11 +91,14 @@ class BrainStream(llm.LLMStream):
 
         async def emit(sentence: str) -> None:
             # Each sentence goes downstream the moment it is complete; the TTS
-            # node starts synthesising while the model is still writing.
+            # node starts synthesising while the model is still writing. When the
+            # campaign enables Natural Pause, a <break> tag is appended so Cartesia
+            # inserts a short pause between sentences.
+            spoken = f"{sentence} {self._parent.pause_tag}" if self._parent.pause_tag else sentence
             self._event_ch.send_nowait(
                 llm.ChatChunk(
                     id=f"turn-{brain.state.turn_count}",
-                    delta=llm.ChoiceDelta(role="assistant", content=sentence + " "),
+                    delta=llm.ChoiceDelta(role="assistant", content=spoken + " "),
                 )
             )
 
@@ -96,7 +108,7 @@ class BrainStream(llm.LLMStream):
                 return
             try:
                 self._parent.tts.update_options(
-                    emotion=emotion, speed=_SPEED[speed])
+                    emotion=emotion, speed=SPEED_SCALE[speed])
             except Exception:
                 # A rejected emotion must never take the call down; speaking in
                 # the previous turn's register is a perfectly survivable outcome.

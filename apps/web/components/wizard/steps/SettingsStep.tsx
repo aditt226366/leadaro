@@ -91,18 +91,11 @@ export function SettingsStep({
             ]}
           />
         </Field>
-        <Field label="Max call duration" hint="Hard cap; the call ends at this point.">
-          <Select
-            value={String(s.max_duration_sec ?? 300)}
-            onChange={(e) => setS({ max_duration_sec: Number(e.target.value) })}
-            options={[
-              { value: "120", label: "2 minutes" },
-              { value: "300", label: "5 minutes" },
-              { value: "600", label: "10 minutes" },
-              { value: "1800", label: "30 minutes" },
-            ]}
-          />
-        </Field>
+        {/* No call-duration cap: a call runs as long as the conversation needs
+            — until the script completes (closing + thank you), the customer
+            ends it, opt-out, or a real end condition fires. There is no
+            backend timer, so this control was removed rather than left to
+            imply one. */}
         <Field
           label="Endpointing delay"
           hint="Silence before the AI assumes the caller finished. Lower feels snappier but cuts people off."

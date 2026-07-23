@@ -93,6 +93,38 @@ def test_inbound_context_is_not_in_system_prompt():
     assert ctx not in prompts.build_system(CAMPAIGN)
 
 
+def test_campaign_fields_drive_the_prompt():
+    """The dashboard fields must actually reach the system prompt."""
+    camp = {
+        "org_name": "CEBOS", "type": "cold_calling", "goal": "book_meeting",
+        "department": "Sales", "language": "ta",
+        "voice_config": {"persona": "an account executive", "tone": "friendly"},
+        "script": {"offer": "an AI calling platform"},
+    }
+    s = prompts.build_system(camp)
+    assert "COLD outreach" in s                     # type → mode
+    assert "Book a meeting" in s                    # goal → objective
+    assert "Sales team" in s                        # department
+    assert "friendly tone" in s                     # tone
+    assert "an AI calling platform" in s            # script.offer
+    assert "ONLY in Tamil" in s                     # language
+
+    # An unknown type/goal is used, not dropped.
+    other = prompts.build_system({"type": "webinar_invite", "goal": "rsvp_confirm"})
+    assert "webinar invite" in other
+    assert "rsvp confirm" in other
+
+
+def test_type_and_goal_maps_cover_the_wizard_values():
+    # Every value the wizard writes must have an explicit mapping (no silent gaps).
+    for t in ("cold_calling", "follow_up", "demo_booking", "renewal_reminder",
+              "customer_success", "recruitment", "promotional_campaign",
+              "nps_campaign"):
+        assert t in prompts.CAMPAIGN_TYPE_MODE, t
+    for g in ("book_meeting", "qualify_lead", "follow_up"):
+        assert g in prompts.CAMPAIGN_GOAL_OBJECTIVE, g
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
