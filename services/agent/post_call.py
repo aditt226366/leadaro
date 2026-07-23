@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -47,6 +49,15 @@ log = logging.getLogger("post_call")
 
 POLL_SECONDS = 3
 MAX_ATTEMPTS = 3
+
+# Stale-call reaper (BUG 1 backstop). A call whose worker was force-killed
+# (Stop-Process -Force) or crashed never runs finish_call, so its row is stuck
+# (status != 'completed', ended_at IS NULL) and shows in Live Monitor forever.
+# Any still-active call with NO activity for this many minutes is force-ended.
+# Configurable via env; ~30 min default. Checked on startup and every
+# REAP_EVERY_SECONDS.
+STALE_CALL_MINUTES = int(os.environ.get("STALE_CALL_MINUTES", "30"))
+REAP_EVERY_SECONDS = int(os.environ.get("REAP_EVERY_SECONDS", "60"))
 
 # Warmer leads get chased sooner. Keyed by the transcript-derived tier below.
 FOLLOWUP_DELAY_DAYS = {"hot": 1, "warm": 2, "scrap": 5}
@@ -72,23 +83,32 @@ because a rep will act on it."""
 
 
 class Summary(BaseModel):
-    """One structured pass over the transcript that carries all six features."""
+    """
+    One structured pass over the transcript that carries all six features.
+
+    NOTE: no length/range constraints (max_length / ge / le). They are stripped
+    from the wire schema for constrained decoding anyway (see api/llm.py) — the
+    "Schema is too complex / Grammar compilation timed out" 400s came from an
+    over-constrained grammar on this many fields — and keeping them on the model
+    would then make re-validation reject a valid-but-longer list. Ranges are
+    clamped in code instead (see _write_summary).
+    """
     # AI Call Summary (feature 6) — read straight from the transcript.
     summary: str = Field(description="2-3 sentences on what happened.")
-    key_points: list[str] = Field(default_factory=list, max_length=6)
-    action_items: list[str] = Field(default_factory=list, max_length=6)
-    pain_points: list[str] = Field(default_factory=list, max_length=6)
+    key_points: list[str] = Field(default_factory=list)
+    action_items: list[str] = Field(default_factory=list)
+    pain_points: list[str] = Field(default_factory=list)
     next_steps: str = ""
     budget: str = ""
     timeline: str = ""
     # AI Sentiment Detection (feature 4) — from the transcript, not per-turn.
-    overall_sentiment: float = Field(ge=-1.0, le=1.0, default=0.0)
+    overall_sentiment: float = 0.0
     sentiment_trajectory: str = ""
     # AI Intent Recognition (feature 5) — the caller's final intent(s).
-    intents: list[str] = Field(default_factory=list, max_length=6)
+    intents: list[str] = Field(default_factory=list)
     # AI Lead Qualification (feature 8) — HOT/WARM/SCRAP from transcript signals.
     qualification_tier: Literal["hot", "warm", "scrap"] = "scrap"
-    qualification_score: int = Field(ge=0, le=100, default=0)
+    qualification_score: int = 0
     # AI Follow-up (feature 7) + Next Best Action (feature 9) — derived last.
     followup_recommendation: str = ""
     next_best_action: str = ""
@@ -146,36 +166,55 @@ async def handle_post_call(payload: dict) -> None:
         if t["role"] == "agent" and t["intent"]:
             state.record(t["sentiment"] or 0.0, t["intent"])
 
+    duration = call["duration_sec"] or 0
+    answered = str(call.get("answered_by") or "unknown")
+
     if not turns:
-        # Voicemail / no-answer: tier from engagement depth, skip the LLM, still
-        # allow follow-up.
+        # BUG 2 guard: a real call — one with duration, or that a human answered
+        # — MUST have a transcript. Zero turns here means post_call ran before
+        # the writes landed, or the rows were lost. Do NOT stamp "no conversation
+        # took place" over a genuine conversation: raise so the job RETRIES.
+        # (worker.py drains all turn writes before enqueuing this job, so a retry
+        # should see the full transcript.)
+        if duration > 0 or answered == "human":
+            log.error("call %s has duration=%ss answered_by=%s but ZERO turns — "
+                      "transcript incomplete/missing; retrying (NOT writing a "
+                      "'no conversation' summary)", call_id, duration, answered)
+            raise RuntimeError(f"{call_id}: real call with no persisted turns")
+        # Genuinely nothing said (voicemail / no-answer, 0s): everything reports
+        # empty, consistently — no LLM call.
+        log.info("call %s had no conversation (answered_by=%s, %ds)",
+                 call_id, answered, duration)
         tier = qualify(state)
         await _write_summary(call_id, None, tier, state)
         await _maybe_schedule_followup(call, state, tier)
         await _update_lead(call, tier)
         return
 
-    # The transcript is the single source of truth for all six features. Loaded
-    # once, analysed once — sentiment/intent/summary/qualification come from the
-    # raw transcript; follow-up + next-best-action are derived from that analysis
-    # in the same structured pass (see SUMMARY_SYSTEM ordering).
+    # Transcript present — analyse it. A failure here PROPAGATES (the job retries)
+    # instead of silently writing a "no conversation" summary while a real
+    # transcript exists — that was the reported contradiction (empty summary next
+    # to sentiment +0.46 / hot lead). With turns present every field is derived
+    # from them or the analysis; the two can never disagree.
     transcript = "\n".join(
         f"{'AGENT' if t['role'] == 'agent' else 'CALLER'}: {t['text']}" for t in turns
     )
-    try:
-        parsed = await api_llm.complete(
-            SUMMARY_SYSTEM,
-            f"Campaign goal: {call['goal'] or 'n/a'}\n"
-            f"Outcome recorded: {call['outcome'] or 'unknown'}\n"
-            f"Duration: {call['duration_sec'] or 0}s over {len(turns)} turns\n\n"
-            f"Transcript:\n{transcript}",
-            max_tokens=1400,
-            output_format=Summary,
-        )
-    except Exception:
-        # A failed analysis must not lose the tiering or the follow-up.
-        log.exception("transcript analysis failed for %s", call_id)
-        parsed = None
+    parsed = await api_llm.complete(
+        SUMMARY_SYSTEM,
+        f"Campaign goal: {call['goal'] or 'n/a'}\n"
+        f"Outcome recorded: {call['outcome'] or 'unknown'}\n"
+        f"Duration: {call['duration_sec'] or 0}s over {len(turns)} turns\n\n"
+        f"Transcript:\n{transcript}",
+        max_tokens=1400,
+        output_format=Summary,
+        # This 16-field summary reliably 400s "Schema is too complex" under
+        # constrained decoding, so skip straight to the JSON-prompt path — one
+        # round trip instead of a guaranteed-to-fail attempt plus the fallback.
+        use_grammar=False,
+    )
+    if parsed is None:
+        raise RuntimeError(f"{call_id}: analysis returned nothing over "
+                           f"{len(turns)} turns; retrying")
 
     tier = _resolve_tier(parsed, state)
     await _write_summary(call_id, parsed, tier, state)
@@ -196,7 +235,9 @@ async def _write_summary(call_id, parsed: Summary | None, tier: str,
     # Sentiment is the transcript-derived reading when we have it; otherwise the
     # average of the per-turn live scores (voicemail / analysis-failed paths).
     if parsed:
-        sentiment_avg = parsed.overall_sentiment
+        # Clamp the now-unconstrained numeric fields (constraints were removed
+        # from the model so the grammar compiles / re-validation stays lenient).
+        sentiment_avg = max(-1.0, min(1.0, parsed.overall_sentiment))
         trajectory = parsed.sentiment_trajectory
         intents = parsed.intents
         next_best = parsed.next_best_action
@@ -230,7 +271,7 @@ async def _write_summary(call_id, parsed: Summary | None, tier: str,
         parsed.timeline if parsed else "",
         sentiment_avg,
         tier,
-        parsed.qualification_score if parsed else 0,
+        max(0, min(100, parsed.qualification_score)) if parsed else 0,
         parsed.followup_recommendation if parsed else "",
         intents,
         next_best,
@@ -290,6 +331,54 @@ async def _run_automations(call, tier: str) -> None:
             )
 
 
+# ── stale-call reaper (BUG 1) ────────────────────────────────────────────────
+
+async def reap_stale_calls() -> int:
+    """
+    Force-end any call whose worker died without running finish_call, so Live
+    Monitor never shows an 80-hour "connected" ghost again.
+
+    A call is stale when it is not yet ended (ended_at IS NULL, status not
+    terminal) AND its last sign of life — the newest turn, else answered_at,
+    else started_at — is older than STALE_CALL_MINUTES. It is marked ended with
+    outcome 'disconnected' (the closest call_outcome value for an abnormal end;
+    the enum has no 'dropped'/'incomplete'), and duration is set from the real
+    last activity, NOT now(), so a ghost doesn't record an 80-hour call.
+
+    Idempotent: an already-ended call is excluded, so this is safe to run every
+    minute. It does NOT enqueue a post_call job — a killed call has no reliable
+    transcript boundary and we don't want to summarise a partial one on a timer.
+    """
+    rows = await db.fetch(
+        """
+        UPDATE calls c
+        SET status = 'completed',
+            ended_at = now(),
+            outcome = COALESCE(c.outcome, 'disconnected'::call_outcome),
+            duration_sec = COALESCE(
+                c.duration_sec,
+                GREATEST(0, EXTRACT(EPOCH FROM (
+                    COALESCE(
+                        (SELECT max(t.created_at) FROM turns t WHERE t.call_id = c.id),
+                        c.answered_at, c.started_at
+                    ) - c.started_at))::int)),
+            error = COALESCE(c.error, 'reaped: no activity, worker died mid-call')
+        WHERE c.ended_at IS NULL
+          AND c.status NOT IN ('completed', 'failed')
+          AND COALESCE(
+                (SELECT max(t.created_at) FROM turns t WHERE t.call_id = c.id),
+                c.answered_at, c.started_at
+              ) < now() - ($1 || ' minutes')::interval
+        RETURNING c.id
+        """,
+        str(STALE_CALL_MINUTES),
+    )
+    if rows:
+        log.warning("reaper: force-ended %d stale call(s) (no activity > %d min) "
+                    "-> outcome 'disconnected'", len(rows), STALE_CALL_MINUTES)
+    return len(rows)
+
+
 # ── queue loop ───────────────────────────────────────────────────────────────
 
 HANDLERS = {"post_call": handle_post_call}
@@ -342,7 +431,14 @@ async def drain_once() -> int:
 
 async def main() -> None:
     await db.init_pool()
-    log.info("post-call worker started")
+    log.info("post-call worker started (stale-call reaper: %d min)",
+             STALE_CALL_MINUTES)
+    # Sweep once on startup — a crash/restart is exactly when ghosts appear.
+    try:
+        await reap_stale_calls()
+    except Exception:
+        log.exception("startup reaper failed; continuing")
+    last_reap = time.monotonic()
     try:
         while True:
             try:
@@ -350,6 +446,13 @@ async def main() -> None:
                     log.info("processed %d job(s)", n)
             except Exception:
                 log.exception("drain failed; continuing")
+            # Periodic reap, independent of whether any jobs were queued.
+            if time.monotonic() - last_reap >= REAP_EVERY_SECONDS:
+                try:
+                    await reap_stale_calls()
+                except Exception:
+                    log.exception("reaper failed; continuing")
+                last_reap = time.monotonic()
             await asyncio.sleep(POLL_SECONDS)
     finally:
         await db.close_pool()

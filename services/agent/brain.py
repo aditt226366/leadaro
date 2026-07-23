@@ -190,8 +190,22 @@ class Brain:
         variables, then strip any remaining double braces (keeping the inner text,
         so a stray "{{Udbhav}}" is spoken as "Udbhav" — never literally). Runs on
         every spoken line before it reaches TTS.
+
+        BUG 3 guard: if any "{{" survives substitution, the script or lead data
+        references a variable we don't know (e.g. a campaign wrote "{{adit}}"
+        instead of "{{first_name}}"). That's a real misconfiguration, so log an
+        ERROR naming the token(s) before we strip the braces — the call still
+        speaks the inner word rather than the literal "{{...}}", but the problem
+        is now visible instead of silent.
         """
         text = prompts.render(text, self.lead)
+        if "{{" in text:
+            leftovers = re.findall(r"\{\{\s*(.*?)\s*\}\}", text)
+            log.error(
+                "unrendered template variable(s) %s survived into spoken text "
+                "(%r) — stripping braces. Fix the campaign script or lead fields.",
+                leftovers, text,
+            )
         return re.sub(r"\{\{\s*|\s*\}\}", "", text)
 
     def note_spoken(self, text: str) -> None:
@@ -398,7 +412,11 @@ class Brain:
         return decide(self.state, "unclear", "continue")
 
     def opening(self) -> str:
-        return prompts.opening_line(self.campaign.get("script") or {}, self.lead)
+        # BUG 3: the opening is spoken text too, so it MUST go through _clean —
+        # previously it used render() only, which leaves an unknown "{{adit}}"
+        # untouched and it was spoken literally. _clean substitutes, logs any
+        # surviving token as an ERROR, and strips the braces.
+        return self._clean(prompts.opening_line(self.campaign.get("script") or {}, self.lead))
 
     async def _localize(self, text: str) -> str:
         """
@@ -454,7 +472,8 @@ class Brain:
         default. Localized like the opening so a Tamil call closes in Tamil.
         """
         script = self.campaign.get("script") or {}
-        base = (script.get("ending_message") or "").strip() or prompts.DEFAULT_ENDING_MESSAGE
+        base = self._clean((script.get("ending_message") or "").strip()
+                           or prompts.DEFAULT_ENDING_MESSAGE)
         return await self._localize(base)
 
     async def closing_statement_localized(self) -> str:
@@ -488,7 +507,7 @@ class Brain:
         their own language. Campaign-overridable via script.opt_out_message.
         """
         script = self.campaign.get("script") or {}
-        base = (script.get("opt_out_message") or "").strip() or (
+        base = self._clean((script.get("opt_out_message") or "").strip() or (
             "Understood, I'll remove you from our list. "
-            "You won't be contacted again.")
+            "You won't be contacted again."))
         return await self._localize(base)

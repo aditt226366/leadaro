@@ -29,6 +29,12 @@ from dialer import AGENT_NAME, OUTBOUND_TRUNK, is_suppressed  # noqa: E402
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/calls", tags=["calls"])
 
+# Live Monitor only shows a call as in-flight if it has had activity within this
+# many minutes — otherwise a stuck row (worker force-killed, finish_call never
+# ran) would show as "connected" for hours until the reaper sweeps it. Shares
+# STALE_CALL_MINUTES with the reaper in post_call.py so the two agree.
+LIVE_STALE_MINUTES = int(os.environ.get("STALE_CALL_MINUTES", "30"))
+
 
 @router.get("")
 async def list_calls(
@@ -477,8 +483,15 @@ async def active_calls(
         WHERE c.org_id = $1
           AND c.ended_at IS NULL
           AND ($2::uuid IS NULL OR c.campaign_id = $2)
+          -- Hide stuck/ghost rows: only show calls with recent activity (newest
+          -- turn, else answered_at, else started_at). A dead call with no turn
+          -- for LIVE_STALE_MINUTES is not "in-flight" regardless of DB status.
+          AND COALESCE(
+                (SELECT max(t.created_at) FROM turns t WHERE t.call_id = c.id),
+                c.answered_at, c.started_at
+              ) > now() - ($3 || ' minutes')::interval
         ORDER BY c.started_at DESC
         """,
-        user.org_id, campaign_id,
+        user.org_id, campaign_id, str(LIVE_STALE_MINUTES),
     )
     return [{**r, "id": str(r["id"])} for r in rows]

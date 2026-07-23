@@ -405,80 +405,92 @@ async def entrypoint(ctx: JobContext) -> None:
         first_line_task = asyncio.create_task(brain.inbound_greeting_localized())
 
     t_pre_start = time.perf_counter()
-    await session.start(
-        room=ctx.room,
-        agent=Agent(instructions=brain.system),
-        room_input_options=RoomInputOptions(close_on_disconnect=True),
-    )
-    t_started = time.perf_counter()
-
-    def _log_first_audio(kind: str, ready_at: float) -> None:
-        log.info(
-            "first-audio timeline [%s]: connect->build=%dms session.start=%dms "
-            "%s_ready=%dms | connect->speaking=%dms (call %s)",
-            kind, int((t_pre_start - t_connect) * 1000),
-            int((t_started - t_pre_start) * 1000),
-            kind, int((ready_at - t_started) * 1000),
-            int((time.perf_counter() - t_connect) * 1000), call_id,
-        )
-
-    if direction == "outbound":
-        # In the call's language, not hardcoded English — a Tamil campaign must
-        # open in Tamil. English campaigns pay no extra latency for this.
-        opening = await first_line_task
-        # Record it before speaking. The opening carries the AI disclosure, so a
-        # transcript without it is an incomplete compliance record. It also has
-        # to enter the model's history — otherwise the first real turn starts
-        # from an empty context and the agent introduces itself a second time.
-        seq["n"] += 1
-        await save_turn(call_id, org_id, seq["n"], "agent", opening, lang=lang)
-        brain.note_spoken(opening)
-        _log_first_audio("opening", time.perf_counter())
-        await session.say(opening, allow_interruptions=True)
-    elif ivr_menu.enabled:
-        # Keypad menu first. Pressing nothing falls through to the AI agent
-        # rather than dropping the caller.
-        choice = await run_menu(session, ctx.room, ivr_menu)
-        if choice:
-            await save_turn(call_id, org_id, 1, "lead",
-                            f"[keypad] pressed {choice.digit} — {choice.label}")
-            seq["n"] = 1
-
-            if choice.action == "hangup":
-                final_outcome["value"] = "not_interested"
-                await session.aclose()
-                return
-            if choice.action == "voicemail":
-                final_outcome["value"] = "voicemail"
-                await session.say(
-                    (campaign.get("script") or {}).get("voicemail_message")
-                    or "Please leave a message after the tone.",
-                )
-                await session.aclose()
-                return
-            if choice.action == "transfer" and choice.target:
-                final_outcome["value"] = "transferred"
-                await _sip_transfer(ctx, choice.target)
-                await session.aclose()
-                return
-            # ai_agent — carry on into the normal conversation.
-    else:
-        # Inbound with no keypad menu — the agent must speak first, in the
-        # number's language, then enter the same turn loop. Without this the
-        # agent sat silent and the inbound caller heard dead air.
-        greeting = await first_line_task
-        seq["n"] += 1
-        await save_turn(call_id, org_id, seq["n"], "agent", greeting, lang=lang)
-        brain.note_spoken(greeting)
-        _log_first_audio("greeting", time.perf_counter())
-        await session.say(greeting, allow_interruptions=True)
-
+    # BUG 1 fix: wrap the ENTIRE session lifecycle — session.start, the opening,
+    # the IVR menu (with its early returns), and the turn loop. However this
+    # exits — normally, via an early `return`, on an exception, or on a
+    # disconnect — the `finally` ALWAYS runs finish_call, so the calls row is
+    # marked ended and can never be left stuck as "connected". Previously only
+    # _run_until_done was wrapped, so a crash in setup or an IVR early-return
+    # skipped finish_call and orphaned the row.
+    #   NOTE: a hard SIGKILL (Stop-Process -Force) cannot run any finally; the
+    #   stale-call reaper in post_call.py is the backstop for force-kill/crash.
     try:
+        await session.start(
+            room=ctx.room,
+            agent=Agent(instructions=brain.system),
+            room_input_options=RoomInputOptions(close_on_disconnect=True),
+        )
+        t_started = time.perf_counter()
+
+        def _log_first_audio(kind: str, ready_at: float) -> None:
+            log.info(
+                "first-audio timeline [%s]: connect->build=%dms session.start=%dms "
+                "%s_ready=%dms | connect->speaking=%dms (call %s)",
+                kind, int((t_pre_start - t_connect) * 1000),
+                int((t_started - t_pre_start) * 1000),
+                kind, int((ready_at - t_started) * 1000),
+                int((time.perf_counter() - t_connect) * 1000), call_id,
+            )
+
+        if direction == "outbound":
+            # In the call's language, not hardcoded English — a Tamil campaign
+            # must open in Tamil. English openings pay no extra latency for this.
+            opening = await first_line_task
+            # Record it before speaking. The opening carries the AI disclosure,
+            # so a transcript without it is an incomplete compliance record. It
+            # also has to enter the model's history — otherwise the first real
+            # turn starts from an empty context and the agent re-introduces itself.
+            seq["n"] += 1
+            await save_turn(call_id, org_id, seq["n"], "agent", opening, lang=lang)
+            brain.note_spoken(opening)
+            _log_first_audio("opening", time.perf_counter())
+            await session.say(opening, allow_interruptions=True)
+        elif ivr_menu.enabled:
+            # Keypad menu first. Pressing nothing falls through to the AI agent
+            # rather than dropping the caller. These early returns now run the
+            # finally (finish_call) on the way out — no orphaned row.
+            choice = await run_menu(session, ctx.room, ivr_menu)
+            if choice:
+                await save_turn(call_id, org_id, 1, "lead",
+                                f"[keypad] pressed {choice.digit} — {choice.label}")
+                seq["n"] = 1
+
+                if choice.action == "hangup":
+                    final_outcome["value"] = "not_interested"
+                    await session.aclose()
+                    return
+                if choice.action == "voicemail":
+                    final_outcome["value"] = "voicemail"
+                    await session.say(
+                        (campaign.get("script") or {}).get("voicemail_message")
+                        or "Please leave a message after the tone.",
+                    )
+                    await session.aclose()
+                    return
+                if choice.action == "transfer" and choice.target:
+                    final_outcome["value"] = "transferred"
+                    await _sip_transfer(ctx, choice.target)
+                    await session.aclose()
+                    return
+                # ai_agent — carry on into the normal conversation.
+        else:
+            # Inbound with no keypad menu — the agent must speak first, in the
+            # number's language, then enter the same turn loop. Without this the
+            # agent sat silent and the inbound caller heard dead air.
+            greeting = await first_line_task
+            seq["n"] += 1
+            await save_turn(call_id, org_id, seq["n"], "agent", greeting, lang=lang)
+            brain.note_spoken(greeting)
+            _log_first_audio("greeting", time.perf_counter())
+            await session.say(greeting, allow_interruptions=True)
+
         await _run_until_done(session, brain, ctx, call_id, org_id,
                               started, final_outcome, seq, lang)
     finally:
-        # Ensure every fire-and-forget transcript write has landed BEFORE we
-        # finalise the call + enqueue post-call (which reads the turns table).
+        # ORDERING (BUG 2): drain every fire-and-forget transcript write FIRST,
+        # so the turns table is complete, THEN finish_call — which marks the row
+        # ended AND enqueues the post_call job. The post-call worker therefore
+        # never reads a half-written transcript.
         await _drain_writes()
         await finish_call(call_id, final_outcome["value"],
                           final_outcome["answered_by"], started,
