@@ -1,24 +1,17 @@
-# fly.toml for leadaro-web (the Next.js dashboard, apps/web).
+# fly.toml app configuration file generated for leadaro-onjwyg on 2026-07-23T23:06:22Z
 #
-# NOTE: the API's fly.toml lives at the repo root (app = 'leadaro-yztmaa').
-# This is a SEPARATE Fly app for the frontend. When launching, point Fly at
-# this config: `fly launch --config apps/web/fly.toml --dockerfile apps/web/Dockerfile`
-# (or set Working directory = apps/web in the dashboard).
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
-# CRITICAL: NEXT_PUBLIC_API_URL is baked into the browser bundle at BUILD time,
-# so it must be a build ARG, not a runtime [env] var. [build.args] below is what
-# actually makes the deployed dashboard talk to the live API instead of
-# localhost:8000. Update both values if the API's URL ever changes, then rebuild.
 
-app = 'leadaro-web'
-primary_region = 'bom'
+app = 'leadaro-onjwyg'
+primary_region = 'nrt'
 
 [build]
   dockerfile = 'Dockerfile'
 
   [build.args]
-    NEXT_PUBLIC_API_URL = 'https://leadaro-yztmaa.fly.dev'
     API_BASE_URL = 'https://leadaro-yztmaa.fly.dev'
+    NEXT_PUBLIC_API_URL = 'https://leadaro-yztmaa.fly.dev'
 
 [http_service]
   internal_port = 3000
@@ -32,3 +25,4 @@ primary_region = 'bom'
   memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
+  memory_mb = 512
