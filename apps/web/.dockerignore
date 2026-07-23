@@ -1,0 +1,12 @@
+# Build context is apps/web (see Dockerfile). The repo-root .dockerignore does
+# NOT apply to a subdirectory context, so exclude the heavy/dirty dirs here or
+# they get shipped to the remote builder and can poison the build.
+node_modules
+.next
+out
+.env
+.env.*
+!.env.example
+npm-debug.log*
+.DS_Store
+tsconfig.tsbuildinfo
