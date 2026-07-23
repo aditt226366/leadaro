@@ -39,3 +39,10 @@ for r in (
 @app.get("/health")
 async def health():
     return {"ok": await db.fetchval("SELECT 1") == 1}
+
+
+# Alias: Teploy's health probe hardcodes /api/health regardless of the "Health
+# check URL" field's value (it never actually hit /health — see the deploy log
+# note about probing /api/health "instead of /"). Same handler, no /api prefix
+# on any other route, so this is purely to satisfy that platform convention.
+app.add_api_route("/api/health", health, methods=["GET"])
