@@ -5,7 +5,13 @@
  * errors come back — so no screen hand-rolls a fetch.
  */
 
-const BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+// Same-origin: every call goes to /api/* on THIS server, which next.config.js
+// proxies to the real API using the runtime API_BASE_URL env var. This means
+// nothing about the API's location is baked into the browser bundle (so no
+// build-time NEXT_PUBLIC_API_URL needed — which Teploy can't inject), and the
+// browser only ever talks to its own origin (so no CORS). Local dev works too:
+// API_BASE_URL defaults to http://localhost:8000 in next.config.js.
+const BASE = "/api";
 const TOKEN_KEY = "leadaro_token";
 
 export function getToken(): string | null {

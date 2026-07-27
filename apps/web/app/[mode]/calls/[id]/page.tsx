@@ -76,7 +76,7 @@ export default function CallDetail() {
 
   async function download() {
     const res = await fetch(
-      `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/calls/${id}/transcript.txt`,
+      `/api/calls/${id}/transcript.txt`,
       { headers: { Authorization: `Bearer ${getToken()}` } },
     );
     const blob = await res.blob();

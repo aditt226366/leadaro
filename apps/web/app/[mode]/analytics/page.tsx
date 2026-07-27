@@ -66,7 +66,7 @@ export default function Analytics() {
   }, [days, mode]);
 
   function exportCsv() {
-    fetch(`${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/exports/calls.csv?days=${days}`,
+    fetch(`/api/exports/calls.csv?days=${days}`,
           { headers: { Authorization: `Bearer ${getToken()}` } })
       .then((r) => r.blob())
       .then((b) => {

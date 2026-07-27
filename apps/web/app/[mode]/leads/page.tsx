@@ -85,7 +85,7 @@ export default function LeadsPage() {
   }
 
   function exportCsv() {
-    const url = `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/exports/leads.csv`;
+    const url = `/api/exports/leads.csv`;
     fetch(url, { headers: { Authorization: `Bearer ${getToken()}` } })
       .then((r) => r.blob())
       .then((b) => {
